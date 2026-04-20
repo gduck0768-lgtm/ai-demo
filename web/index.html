@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI聊天</title>
+  <title>葛城美里</title>
 
   <style>
     body {
@@ -71,6 +71,11 @@
 </div>
 
 <script>
+
+//userId
+const userId = localStorage.getItem("uid") || Date.now().toString();
+localStorage.setItem("uid", userId);
+
 //防XSS
 function escapeHtml(text) {
   return text
@@ -154,7 +159,10 @@ async function send() {
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ text })
+      body: JSON.stringify({ 
+	text,
+	userId 
+      })
     });
 
     const data = await res.json();

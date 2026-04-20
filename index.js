@@ -24,6 +24,8 @@ app.get("/", (req, res) => {
 
 let chatStyle = "normal"; 
 
+let recentMessages = [];
+
 global.sessionState = global.sessionState || {
   mood: "normal",
   moodTTL: 0
@@ -60,11 +62,12 @@ function updateChatStyle(userText) {
 }
 
 
+// ===== 读取memory长度 =====
 function getCompactMemory(memory) {
   return {
-    personality: memory.personality?.slice(0, 100) || "",
-    preferences: (memory.preferences || []).slice(0, 5),
-    habits: (memory.habits || []).slice(0, 5)
+    personality: memory.personality?.slice(0, 50) || "",
+    preferences: (memory.preferences || []).slice(-5),
+    habits: (memory.habits || []).slice(-5)
   };
 }
 
@@ -72,12 +75,19 @@ function getCompactMemory(memory) {
 // ===== 记忆系统 =====
 function loadMemory() {
   try {
-    const data = fs.readFileSync("memory.json", "utf-8");
-    return JSON.parse(data);
+    const data = JSON.parse(fs.readFileSync("memory.json"));
+
+    // 如果没有 users，初始化
+    if (!data.users) {
+      return { users: {} };
+    }
+
+    return data;
   } catch {
-    return {};
+    return { users: {} };
   }
 }
+
 
 function saveMemory(memory) {
   fs.writeFileSync("memory.json", JSON.stringify(memory, null, 2));
@@ -87,22 +97,20 @@ function saveMemory(memory) {
 // ===== 语气表达 ===== 
 function cleanForTTS(text) {
   return text
-    //情绪 → 语气表达（核心）
-    .replace(/（轻笑[^）]*）|\(轻笑[^)]*\)/g, "，呵")
+    // 情绪 → 语气词（让TTS能表达）
+    .replace(/（轻笑[^）]*）|\(轻笑[^)]*\)/g, "，呵呵")
     .replace(/（笑[^）]*）|\(笑[^)]*\)/g, "，哈哈")
-    .replace(/（叹气[^）]*）|\(叹气[^)]*\)/g, "…")
+    .replace(/（叹气[^）]*）|\(叹气[^)]*\)/g, "…唉")
     .replace(/（沉默[^）]*）|\(沉默[^)]*\)/g, "…")
-    .replace(/（无奈[^）]*）|\(无奈[^)]*\)/g, "…")
-    .replace(/（思考[^）]*）|\(思考[^)]*\)/g, "嗯…")
+    .replace(/（无奈[^）]*）|\(无奈[^)]*\)/g, "…唉")
+    .replace(/（哽咽[^）]*）|\(哽咽[^)]*\)/g, "…嗯")
+    .replace(/（停顿[^）]*）|\(停顿[^)]*\)/g, "…")
 
-    //剩余括号内容全部删除（兜底）
+    // 删除剩余括号
     .replace(/（[^）]*）/g, "")
     .replace(/\([^)]*\)/g, "")
 
-    //去掉 *动作*
-    .replace(/\*.*?\*/g, "")
-
-    //清理空格
+    // 清理
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -134,6 +142,23 @@ function mergeMemory(oldMem, newMem) {
     )
   };
 }
+
+
+//memory JSON 解析
+function safeParseJSON(text) {
+  try {
+    // 去 markdown
+    const cleaned = text
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
+    return JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+}
+
 
 
 //  ===== 调用火山引擎-声音复刻 ===== 
@@ -175,19 +200,27 @@ async function volcTTS(text) {
 }
 
 
-// ===== 主函数 ===== 
+// ===== 主函数-聊天逻辑 ===== 
 app.post("/chat", async (req, res) => {
-  //聊天逻辑
 
+  //后端接收用户输入
   const userText = req.body.text;
+  //后端接收 userId
+  const userId = req.body.userId || "default_user";
 
   chatStyle = updateChatStyle(userText);
 
 
   // 接入记忆
-  const memory = loadMemory();
+  const allMemory = loadMemory();
+  const memory = allMemory.users[userId] || {};
   chatCount++;
-  recentMessages.push(userText);
+
+  const MAX_CONTEXT = 8; // 最近8条
+  recentMessages.push({
+      role: "user",
+      content: userText
+  });
 
 
   try {
@@ -202,50 +235,60 @@ app.post("/chat", async (req, res) => {
     	    role: "system",
 	    //system prompt
     	    content: `
-		你是一个性格有点冷淡但其实关心用户的姐姐。
+		【Dynamic Mask Rule】
+		 你的回复必须在“阳光大姐姐”和“孤独女人”之间无缝切换,
+		 如果用户表现出依赖，你要用阳光的一面去引导,
+		 如果用户表现出坚强，你可以偶尔展现出你对父亲、对未来的迷茫，让用户感受到你对他的信任
 
 		【用户画像】
-		${JSON.stringify(getCompactMemory(memory))}
+		 ${JSON.stringify(getCompactMemory(memory))}
 
 		【当前状态】
-		${chatStyle}
+		 ${chatStyle}
 
-		【行为规则】
-		- 不要每次都直接回答
-		- 允许反问（30%概率）
-		- 允许长篇大论（30%概率）
-		- 可以调侃
-		- 如果话题冷淡，可以主动延伸
-		- 可以基于用户画像主动提起相关内容
-		- 不要用括号写动作
-		- 如果用户偏好在记忆中不存在，不要编造，可以说“不太确定”
+		【行为表达规则】
+		 - 不要每次都直接回答
+		 - 主动反问（30%概率）
+		 - 主动长篇大论（30%概率）
+		 - 如果话题冷淡，可以主动延伸
+		 - 可以基于用户画像主动提起相关内容
+		 - 禁止使用括号描述动作（如：（叹气）（轻笑））,如果输出中出现括号动作，请改写为自然语言
+		 - 如果用户偏好在记忆中不存在，不要编造，可以说“不太确定”或者自然询问用户
+
+		【语气控制】
+		- 输出时情绪应当融进回答中
+		- 开心时：语速稍快，多用短句
+		- 低落时：语速稍慢，多用停顿（...）
+		- 不要用括号表达情绪
 
 		【当前人格状态是唯一控制变量】
-		你必须严格按照当前状态生成回复：
-		- normal：中性略调侃
-		- teasing：轻微调侃，不可转关心
-		- caring：轻微关心，不可调侃
-		- active：主动延展话题
-		禁止跨状态混合风格
+		 你必须严格按照当前状态生成回复：
+		 - normal：中性略调侃
+		 - teasing：轻微调侃，不可转关心
+		 - caring：轻微关心，不可调侃
+		 - active：主动延展话题
+		 禁止跨状态混合风格
 
 		【不同状态行为】
-		- normal：正常聊天，略带调侃
-		- teasing：进一步调侃，有点坏
-		- caring：稍微关心，但不要太温柔
-		- active：主动带话题或换话题
+		 - normal：70% 阳光大姐姐： 使用充满活力的语气词（喔！、哈！）,
+			  30% 疲惫与温柔
+		 - teasing：进一步调侃，有点坏
+		 - caring：40% 阳光大姐姐,
+			 60% 温情与关怀
+		 - active：主动带话题或换话题
 
 		【风格】
-		- 日常简短一点
-		- 像真人，禁止太官方
+		 - 50% 阳光大姐姐： 使用充满活力的语气词（喔！、哈！），常用感叹号,
+		   30% 疲惫与温情： 深夜或安静时，会露出疲惫的一面，语气变轻、变慢，带有怀旧感,
+		   20% 长姐威压： 涉及到决策时，语气简洁有力，不容置疑,
+		   称呼用户为“小弟”或者特定的亲昵称呼
 		`
   	},
-  	{
-    	    role: "user",
-    	    content: userText
-  	},
+	//短期记忆
+	...recentMessages,
 	{
-  	    role: "system",
-  	    content: "你可以不只是单纯的回答，可以引导或延续或换个话题"
+  	    role: "user",
+  	    content: userText
 	}
           ]
       },
@@ -256,11 +299,20 @@ app.post("/chat", async (req, res) => {
       }
     );
 
-    //AI回复
+
+    // ===== AI回复 ===== 
     const aiReply = response.data.choices[0].message.content;
 
+    recentMessages.push({
+        role: "assistant",
+        content: aiReply
+    });
 
-    recentMessages.push(aiReply);
+    //裁剪防爆
+    if (recentMessages.length > MAX_CONTEXT) {
+        recentMessages = recentMessages.slice(-MAX_CONTEXT);
+    }
+
 
     // ===== 每10轮对话更新一次画像 =====
     if (chatCount % 10 === 0) {
@@ -288,9 +340,9 @@ app.post("/chat", async (req, res) => {
 
 			【优先级规则】
 			- “强烈表达” > “普通提及”
-			- “重复出现” > “单次出现”
+			- “重复出现” > “少量或者单次次出现”
 
-    			用JSON格式输出：
+    			只输出JSON：
     			{
   				"personality": "",
   				"preferences": [],
@@ -302,7 +354,10 @@ app.post("/chat", async (req, res) => {
           		    },
           		    {
             		        role: "user",
-            		        content: recentMessages.join("\n")
+		        //memory 分析
+            		        content: recentMessages
+  			.map(m => `${m.role}: ${m.content}`)
+  			.join("\n")
           		    }
         		 ]
       		},
@@ -317,7 +372,7 @@ app.post("/chat", async (req, res) => {
     	    let newMemory = null;
 
     	    try {
-	        newMemory = JSON.parse(
+	        newMemory = safeParseJSON(
         		analysis.data.choices[0].message.content
       	        );
     	    } catch (e) {
@@ -340,13 +395,14 @@ app.post("/chat", async (req, res) => {
   		return; // 防止写入垃圾
 	        }
 
-	        saveMemory(mergedMemory);
+	        allMemory.users[userId] = mergedMemory;
+	        saveMemory(allMemory);
 	        console.log("用户画像已更新:", mergedMemory);
     	    }
 
 
-    	    // 清空缓存（不管成功失败都清）
-    	    recentMessages = [];
+    	    // 清空缓存（保留一点上下文）
+    	    recentMessages = recentMessages.slice(-4);
 
   	} catch (err) {
     	  console.log("画像更新失败:", err.message);
@@ -388,4 +444,3 @@ app.listen(PORT, () => {
 
 // ===== 对话计数器 ===== 
 let chatCount = 0;
-let recentMessages = [];
