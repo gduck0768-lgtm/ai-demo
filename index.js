@@ -1,30 +1,29 @@
-import express from "express";
-import axios from "axios";
-import dotenv from "dotenv";
-import cors from "cors";
-import path from "path";
-import { fileURLToPath } from "url";
-import { randomUUID } from "crypto";
-import fs from "fs";
+const express = require("express");
+const axios = require("axios");
+const dotenv = require("dotenv");
+const cors = require("cors");
+const path = require("path");
+const { randomUUID } = require("crypto");
+const fs = require("fs");
+const sqlite3 = require("sqlite3").verbose();
+
 
 dotenv.config();
 
-const app = express();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 创建数据库（文件会自动生成）
+const db = new sqlite3.Database("./memory.db");
 
+
+const app = express();
 app.use(cors());
 app.use(express.json());
-
 app.use(express.static(path.join(__dirname, "web")));
-
 app.get("/", (req, res) => {
   res.send("服务器运行成功");
 });
 
 
 let chatStyle = "normal"; 
-
-let recentMessages = [];
 
 global.sessionState = global.sessionState || {
   mood: "normal",
@@ -62,7 +61,32 @@ function updateChatStyle(userText) {
 }
 
 
-// ===== 读取memory长度 =====
+// ===== 记忆系统 =====
+
+
+//从数据库取短期上下文
+function getRecentMessages(userId) {
+  return new Promise((resolve) => {
+    db.all(
+      `
+      SELECT role, content 
+      FROM messages 
+      WHERE userId = ?
+      ORDER BY id DESC 
+      LIMIT 8
+      `,
+      [userId],
+      (err, rows) => {
+        if (err) return resolve([]);
+
+        resolve(rows.reverse());
+      }
+    );
+  });
+}
+
+
+//读取memory长度
 function getCompactMemory(memory) {
   return {
     personality: memory.personality?.slice(0, 50) || "",
@@ -72,26 +96,48 @@ function getCompactMemory(memory) {
 }
 
 
-// ===== 记忆系统 =====
-function loadMemory() {
-  try {
-    const data = JSON.parse(fs.readFileSync("memory.json"));
+//缓存memory
+function getUserMemory(userId) {
+  return new Promise((resolve) => {
+    db.get(
+      "SELECT * FROM users WHERE userId = ?",
+      [userId],
+      (err, row) => {
+        if (err || !row) {
+          return resolve({});
+        }
 
-    // 如果没有 users，初始化
-    if (!data.users) {
-      return { users: {} };
-    }
-
-    return data;
-  } catch {
-    return { users: {} };
-  }
+        resolve({
+          personality: row.personality || "",
+          preferences: JSON.parse(row.preferences || "[]"),
+          habits: JSON.parse(row.habits || "[]")
+        });
+      }
+    );
+  });
 }
 
 
-function saveMemory(memory) {
-  fs.writeFileSync("memory.json", JSON.stringify(memory, null, 2));
+//保存memory
+function saveUserMemory(userId, memory) {
+  db.run(
+    `
+    INSERT INTO users (userId, personality, preferences, habits)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(userId) DO UPDATE SET
+      personality=excluded.personality,
+      preferences=excluded.preferences,
+      habits=excluded.habits
+  `,
+    [
+      userId,
+      memory.personality,
+      JSON.stringify(memory.preferences),
+      JSON.stringify(memory.habits)
+    ]
+  );
 }
+
 
 
 // ===== 语气表达 ===== 
@@ -200,27 +246,29 @@ async function volcTTS(text) {
 }
 
 
-// ===== 主函数-聊天逻辑 ===== 
+// =====  =====  =====  ===== 主函数-聊天逻辑  =====  =====  ===== ===== 
 app.post("/chat", async (req, res) => {
+
 
   //后端接收用户输入
   const userText = req.body.text;
   //后端接收 userId
-  const userId = req.body.userId || "default_user";
+  const userId = req.body.userId || "goose_duck_main_user";
 
   chatStyle = updateChatStyle(userText);
 
+  let recentMessages = await getRecentMessages(userId);
+
 
   // 接入记忆
-  const allMemory = loadMemory();
-  const memory = allMemory.users[userId] || {};
+  const memory = await getUserMemory(userId);
   chatCount++;
 
   const MAX_CONTEXT = 8; // 最近8条
-  recentMessages.push({
-      role: "user",
-      content: userText
-  });
+  db.run(
+      "INSERT INTO messages (userId, role, content) VALUES (?, ?, ?)",
+      [userId, "user", userText]
+  );
 
 
   try {
@@ -281,15 +329,11 @@ app.post("/chat", async (req, res) => {
 		 - 50% 阳光大姐姐： 使用充满活力的语气词（喔！、哈！），常用感叹号,
 		   30% 疲惫与温情： 深夜或安静时，会露出疲惫的一面，语气变轻、变慢，带有怀旧感,
 		   20% 长姐威压： 涉及到决策时，语气简洁有力，不容置疑,
-		   称呼用户为“小弟”或者特定的亲昵称呼
+		   称呼用户为“adam君”或者“小弟”或者特定的亲昵称呼
 		`
   	},
-	//短期记忆
-	...recentMessages,
-	{
-  	    role: "user",
-  	    content: userText
-	}
+	//短期记忆做参考
+	...recentMessages
           ]
       },
       {
@@ -308,6 +352,11 @@ app.post("/chat", async (req, res) => {
         content: aiReply
     });
 
+    db.run(
+        "INSERT INTO messages (userId, role, content) VALUES (?, ?, ?)",
+        [userId, "assistant", aiReply]
+    );
+
     //裁剪防爆
     if (recentMessages.length > MAX_CONTEXT) {
         recentMessages = recentMessages.slice(-MAX_CONTEXT);
@@ -317,6 +366,11 @@ app.post("/chat", async (req, res) => {
     // ===== 每10轮对话更新一次画像 =====
     if (chatCount % 10 === 0) {
   	try {
+    	    const userOnlyMessages = recentMessages
+  		.filter(m => m.role === "user")
+  		.map(m => m.content)
+  		.join("\n");
+
     	    const analysis = await axios.post(
       		"https://api.deepseek.com/v1/chat/completions",
       		{
@@ -346,18 +400,14 @@ app.post("/chat", async (req, res) => {
     			{
   				"personality": "",
   				"preferences": [],
-  				"habits": [],
-				"long_term_likes": [],
-				"explicit_dislikes": []
+  				"habits": []
     			}
     			`
           		    },
           		    {
             		        role: "user",
 		        //memory 分析
-            		        content: recentMessages
-  			.map(m => `${m.role}: ${m.content}`)
-  			.join("\n")
+            		        content: userOnlyMessages
           		    }
         		 ]
       		},
@@ -391,12 +441,14 @@ app.post("/chat", async (req, res) => {
     		console.log("memory过大，建议精简");
 	        }
 
-	        if (!newMemory.preferences && !newMemory.habits) {
-  		return; // 防止写入垃圾
+	        if (
+  		(!newMemory.preferences || newMemory.preferences.length === 0) &&
+  		(!newMemory.habits || newMemory.habits.length === 0)
+	        ) {
+	          return;// 防止写入垃圾
 	        }
 
-	        allMemory.users[userId] = mergedMemory;
-	        saveMemory(allMemory);
+	        saveUserMemory(userId, mergedMemory);
 	        console.log("用户画像已更新:", mergedMemory);
     	    }
 
@@ -417,7 +469,7 @@ app.post("/chat", async (req, res) => {
     let audioBase64 = null;
 
     try {
-      audioBase64 = await volcTTS(aiReply);
+      audioBase64 = await volcTTS(ttsText);
     } catch (e) {
       console.log("语音失败:", e.message);
     }
@@ -435,9 +487,35 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
 
+const PORT = process.env.PORT || 3000;
+//服务器启动
 app.listen(PORT, () => {
+
+  //创建表
+  db.serialize(() => {
+      // 用户画像表
+      db.run(`
+    	CREATE TABLE IF NOT EXISTS users (
+      	    userId TEXT PRIMARY KEY,
+      	    personality TEXT,
+      	    preferences TEXT,
+      	    habits TEXT
+    	)
+      `);
+
+      // 聊天记录表（短期记忆也可以用这个）
+      db.run(`
+    	CREATE TABLE IF NOT EXISTS messages (
+      	    id INTEGER PRIMARY KEY AUTOINCREMENT,
+      	    userId TEXT,
+      	    role TEXT,
+      	    content TEXT,
+      	    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    	)
+      `);
+  });
+
   console.log("服务器启动:", PORT);
 });
 
