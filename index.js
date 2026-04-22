@@ -5,13 +5,13 @@ const cors = require("cors");
 const path = require("path");
 const { randomUUID } = require("crypto");
 const fs = require("fs");
-const sqlite3 = require("sqlite3").verbose();
+const { Pool } = require("pg");
 
 
 dotenv.config();
 
-// 创建数据库（文件会自动生成）
-const db = new sqlite3.Database("./memory.db");
+// 创建数据库
+const db = require("./db");
 
 
 const app = express();
@@ -65,24 +65,23 @@ function updateChatStyle(userText) {
 
 
 //从数据库取短期上下文
-function getRecentMessages(userId) {
-  return new Promise((resolve) => {
-    db.all(
+async function getRecentMessages(userId) {
+  try {
+    const result = await db.query(
       `
       SELECT role, content 
       FROM messages 
-      WHERE userId = ?
+      WHERE userId = $1
       ORDER BY id DESC 
       LIMIT 8
       `,
-      [userId],
-      (err, rows) => {
-        if (err) return resolve([]);
-
-        resolve(rows.reverse());
-      }
+      [userId]
     );
-  });
+
+    return result.rows.reverse();
+  } catch (err) {
+    return [];
+  }
 }
 
 
@@ -97,38 +96,38 @@ function getCompactMemory(memory) {
 
 
 //缓存memory
-function getUserMemory(userId) {
-  return new Promise((resolve) => {
-    db.get(
-      "SELECT * FROM users WHERE userId = ?",
-      [userId],
-      (err, row) => {
-        if (err || !row) {
-          return resolve({});
-        }
-
-        resolve({
-          personality: row.personality || "",
-          preferences: JSON.parse(row.preferences || "[]"),
-          habits: JSON.parse(row.habits || "[]")
-        });
-      }
+async function getUserMemory(userId) {
+  try {
+    const result = await db.query(
+      "SELECT * FROM users WHERE userId = $1",
+      [userId]
     );
-  });
+
+    const row = result.rows[0];
+    if (!row) return {};
+
+    return {
+      personality: row.personality || "",
+      preferences: JSON.parse(row.preferences || "[]"),
+      habits: JSON.parse(row.habits || "[]")
+    };
+  } catch (err) {
+    return {};
+  }
 }
 
 
 //保存memory
-function saveUserMemory(userId, memory) {
-  db.run(
+async function saveUserMemory(userId, memory) {
+  await db.query(
     `
     INSERT INTO users (userId, personality, preferences, habits)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(userId) DO UPDATE SET
-      personality=excluded.personality,
-      preferences=excluded.preferences,
-      habits=excluded.habits
-  `,
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (userId) DO UPDATE SET
+      personality = EXCLUDED.personality,
+      preferences = EXCLUDED.preferences,
+      habits = EXCLUDED.habits
+    `,
     [
       userId,
       memory.personality,
@@ -263,10 +262,10 @@ app.post("/chat", async (req, res) => {
   // 接入记忆
   const memory = await getUserMemory(userId);
   chatCount++;
-
   const MAX_CONTEXT = 8; // 最近8条
-  db.run(
-      "INSERT INTO messages (userId, role, content) VALUES (?, ?, ?)",
+
+  await db.query(
+      "INSERT INTO messages (userId, role, content) VALUES ($1, $2, $3)",
       [userId, "user", userText]
   );
 
@@ -352,8 +351,8 @@ app.post("/chat", async (req, res) => {
         content: aiReply
     });
 
-    db.run(
-        "INSERT INTO messages (userId, role, content) VALUES (?, ?, ?)",
+    await db.query(
+        "INSERT INTO messages (userId, role, content) VALUES ($1, $2, $3)",
         [userId, "assistant", aiReply]
     );
 
@@ -490,33 +489,35 @@ app.post("/chat", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 //服务器启动
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
+  console.log("服务器启动成功:", PORT);
 
-  //创建表
-  db.serialize(() => {
-      // 用户画像表
-      db.run(`
-    	CREATE TABLE IF NOT EXISTS users (
-      	    userId TEXT PRIMARY KEY,
-      	    personality TEXT,
-      	    preferences TEXT,
-      	    habits TEXT
-    	)
-      `);
+  try {
+    // 创建 users 表
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        userId TEXT PRIMARY KEY,
+        personality TEXT,
+        preferences TEXT,
+        habits TEXT
+      );
+    `);
 
-      // 聊天记录表（短期记忆也可以用这个）
-      db.run(`
-    	CREATE TABLE IF NOT EXISTS messages (
-      	    id INTEGER PRIMARY KEY AUTOINCREMENT,
-      	    userId TEXT,
-      	    role TEXT,
-      	    content TEXT,
-      	    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    	)
-      `);
-  });
+    // 创建 messages 表
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        userId TEXT,
+        role TEXT,
+        content TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
-  console.log("服务器启动:", PORT);
+    console.log("数据库表初始化完成");
+  } catch (err) {
+    console.error("数据库初始化失败:", err.message);
+  }
 });
 
 
