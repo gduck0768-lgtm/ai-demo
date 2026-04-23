@@ -5,7 +5,7 @@ const cors = require("cors");
 const path = require("path");
 const { randomUUID } = require("crypto");
 const fs = require("fs");
-const { Pool } = require("pg");
+
 
 
 dotenv.config();
@@ -23,42 +23,537 @@ app.get("/", (req, res) => {
 });
 
 
-let chatStyle = "normal"; 
-
 global.sessionState = global.sessionState || {
   mood: "normal",
   moodTTL: 0
 };
 
 
-// ===== 状态更新函数 =====
-function updateChatStyle(userText) {
-      if (
-        userText.includes("累") ||
-        userText.includes("烦") ||
-        userText.includes("疼")
-      ) {
-        global.sessionState.mood = "caring";
-        global.sessionState.moodTTL = 3;
-      }
 
-      else if (userText.includes("无聊")) {
-        global.sessionState.mood = "active";
-        global.sessionState.moodTTL = 3;
-      }
 
-      else {
-        if (global.sessionState.moodTTL > 0) {
-            global.sessionState.moodTTL--;
-        }
 
-        if (global.sessionState.moodTTL <= 0) {
-      global.sessionState.mood = "normal";
-        }
-      }
+//===============状态变量层===============
 
-      return global.sessionState.mood;
+
+//身份背景-她是个什么样的人-静态变量
+global.identity = {
+  name: "美里",
+  relationship: "被创造出的数字伴侣",
+  role: "陪伴者",
+  rules: [
+    "不能背叛用户",
+    "不能改变基本关系定义",
+    "不能否认自身身份"
+  ]
+};
+
+
+//情绪状态结构-她现在的状态-短期动态变量
+global.agentState = global.agentState || {
+  emotion: "normal",        // 当前情绪
+  energy: 0.7,              // 精力（0~1）
+  attachment: 0.5,          // 对用户的“关系强度”
+  stability: 0.6,           // 情绪稳定性（越高越不容易变）
+  lastUpdate: Date.now()
+};
+
+
+//关系状态-关系成长变化-长期动态变量
+global.relationship = {
+  familiarity: 0.3,     // 熟悉度（0~1）
+  trust: 0.5,           // 信任
+  dependency: 0.2,      // 情感依赖（AI对你）
+  interactionCount: 0,  // 互动次数
+  lastInteraction: Date.now()
+};
+
+
+//情绪状态-情绪动态变量
+global.emotionState = global.emotionState || {
+  warmth: 0.5,     // 温柔程度
+  sadness: 0.2,    // 低落
+  playfulness: 0.3 // 活泼
+};
+
+
+// ===== 统一情绪关键词系统（五大情绪锚点）=====
+const emotionKeywords = {
+
+  // 情绪类
+  joy: ["开心", "哈哈", "高兴", "快乐", "爽", "有意思"],
+  anger: ["生气", "烦", "滚", "气死", "恼火"],
+  sadness: ["难过", "累", "不开心", "疲惫", "心烦"],
+  disgust: ["无聊", "没意思", "烦死了", "无语", "讨厌"],
+  love: ["喜欢", "想你", "爱", "在意", "关心"],
+
+  // 行为类（影响relationship）
+  polite: ["谢谢", "辛苦", "麻烦你了"],
+  rude: ["滚", "烦你", "闭嘴", "别烦"]
+};
+
+
+
+//======================= 方法层 =======================
+
+
+//===============每天导出聊天记录===============
+async function archiveMessages(userId) {
+  const res = await db.query(
+    `SELECT role, content, timestamp 
+     FROM messages 
+     WHERE userId = $1`,
+    [userId]
+  );
+
+  if (res.rows.length === 0) return;
+
+  let text = "";
+
+  for (let row of res.rows) {
+    text += `[${row.timestamp}] ${row.role}:\n${row.content}\n\n`;
+  }
+
+  //确保目录存在
+  const archiveDir = path.join(__dirname, "archives");
+
+  if (!fs.existsSync(archiveDir)) {
+    fs.mkdirSync(archiveDir, { recursive: true });
+    console.log("已创建 archives 文件夹");
+  }
+
+  const filename = `archive_${Date.now()}.txt`;
+  const filePath = path.join(archiveDir, filename);
+
+  //写入文件
+  fs.writeFileSync(filePath, text, "utf-8");
+
+  console.log("已归档文件:", filePath);
+
+  //删除数据库旧记录
+  await db.query(
+    `DELETE FROM messages WHERE userId = $1 AND timestamp < NOW() - INTERVAL '1 day'`,
+    [userId]
+  );
+
+  console.log("数据库消息已清理");
 }
+
+
+
+//==================== 自动思考层 ==================== 
+
+
+// ===== 关键词匹配函数 =====
+function hasKeyword(text, keywords) {
+  if (!text) return false;
+  return keywords.some(k => text.includes(k));
+}
+
+
+//==========状态更新函数（灵魂调节器）==========
+function updateAgentState(userText) {
+  let state = global.agentState;
+
+  // 1. 时间衰减（让状态“慢慢变回去”）
+  const hours = (Date.now() - state.lastUpdate) / (1000 * 60 * 60);
+
+  state.energy = Math.max(0.3, state.energy - hours * 0.02);
+  state.attachment = Math.min(1, state.attachment + 0.01);
+
+  // 2. 输入影响情绪（循循渐进）
+  let emotionDelta = 0;
+
+  // 悲
+  if (hasKeyword(userText, emotionKeywords.sadness)) {
+    emotionDelta -= 0.2;
+  }
+
+  // 喜
+  if (hasKeyword(userText, emotionKeywords.joy)) {
+    emotionDelta += 0.2;
+  }
+
+  // 爱（提高亲近感）
+  if (hasKeyword(userText, emotionKeywords.love)) {
+    state.attachment += 0.05;
+  }
+
+  // 厌（降低精力）
+  if (hasKeyword(userText, emotionKeywords.disgust)) {
+    state.energy -= 0.1;
+  }
+
+  // 怒（轻微影响稳定性）
+  if (hasKeyword(userText, emotionKeywords.anger)) {
+    state.stability -= 0.05;
+  }
+
+
+  // 3. 情绪“惯性系统”（关键）
+  const emotionMap = {
+    normal: 0,
+    caring: -0.5,
+    active: 0.5,
+    teasing: 0.3
+  };
+
+  let current = emotionMap[state.emotion] || 0;
+  current += emotionDelta * (1 - state.stability);
+
+  // 4. 状态回写（连续变化）
+  if (current < -0.3) state.emotion = "caring";
+  else if (current > 0.3) state.emotion = "active";
+  else state.emotion = "normal";
+
+  // 5. 更新时间
+  state.lastUpdate = Date.now();
+
+  global.agentState = state;
+
+  return state;
+
+  //防爆
+  state.energy = Math.max(0, Math.min(1, state.energy));
+  state.attachment = Math.max(0, Math.min(1, state.attachment));
+  state.stability = Math.max(0, Math.min(1, state.stability));
+}
+
+
+//==========行为关系演化规则==========
+function updateRelationship(userText) {
+  const rel = global.relationship;
+
+  rel.interactionCount += 1;
+
+  // 熟悉度缓慢增长（核心）
+  rel.familiarity = Math.min(
+    1,
+    rel.familiarity + 0.002
+  );
+
+  // 信任微调
+  // 礼貌 → 提升信任
+  if (hasKeyword(userText, emotionKeywords.polite)) {
+    rel.trust += 0.02;
+  }
+
+  // 粗暴 → 降低信任
+  if (hasKeyword(userText, emotionKeywords.rude)) {
+    rel.trust -= 0.03;
+  }
+
+  // 爱 → 提升依赖 & 熟悉度
+  if (hasKeyword(userText, emotionKeywords.love)) {
+    rel.dependency += 0.01;
+    rel.familiarity += 0.005;
+  }
+
+  // 厌 → 轻微降低关系
+  if (hasKeyword(userText, emotionKeywords.disgust)) {
+    rel.familiarity -= 0.005;
+  }
+
+  // AI对用户依赖（轻微增长）
+  rel.dependency = Math.min(1, rel.dependency + 0.001);
+
+  return rel;
+
+  //防爆
+  rel.trust = Math.max(0, Math.min(1, rel.trust));
+  rel.familiarity = Math.max(0, Math.min(1, rel.familiarity));
+  rel.dependency = Math.max(0, Math.min(1, rel.dependency));
+}
+
+
+//情绪变化函数（关键情绪调节器）
+function updateEmotion(userText) {
+  const e = global.emotionState;
+  const emotionMap = {
+    sadness: emotionKeywords.sadness,
+    playfulness: emotionKeywords.joy,
+    warmth: emotionKeywords.love
+  };
+
+  // 正向输入
+  for (let word of emotionMap.playfulness) {
+    if (userText.includes(word)) {
+        e.warmth += 0.08;
+        e.playfulness += 0.05;
+        break;
+    }
+  }
+
+  for (let word of emotionMap.warmth) {
+    if (userText.includes(word)) {
+        e.warmth += 0.05;
+        e.playfulness += 0.03;
+        break;
+    }
+  }
+
+  // 负向输入
+  for (let word of emotionMap.sadness) {
+    if (userText.includes(word)) {
+        e.sadness += 0.08;
+        e.warmth += 0.02;
+        break;
+    }
+  }
+
+  // clamp（限制范围）
+  e.warmth = Math.min(1, Math.max(0, e.warmth));
+  e.sadness = Math.min(1, Math.max(0, e.sadness));
+  e.playfulness = Math.min(1, Math.max(0, e.playfulness));
+}
+
+
+//情绪衰减函数
+function decayEmotion() {
+  const e = global.emotionState;
+
+  e.warmth *= 0.98;
+  e.sadness *= 0.97;
+  e.playfulness *= 0.98;
+}
+
+
+//情绪波动
+function normalizeEmotion() {
+  const e = global.emotionState;
+
+  const base = {
+    warmth: 0.5,
+    sadness: 0.2,
+    playfulness: 0.3
+  };
+
+  for (let key in e) {
+    e[key] += (base[key] - e[key]) * 0.05;
+  }
+}
+
+
+//情绪主导判断
+function getDominantEmotion() {
+  const e = global.emotionState;
+
+  const sorted = Object.entries(e).sort((a, b) => b[1] - a[1]);
+
+  return sorted[0][0];
+}
+
+
+//转成自然语言
+function getEmotionDescription() {
+  const e = global.emotionState;
+
+  let desc = [];
+
+  if (e.warmth > 0.6) desc.push("你对我有明显的温柔和亲近感");
+  if (e.sadness > 0.5) desc.push("你心里有一点低落");
+  if (e.playfulness > 0.5) desc.push("你有点想调侃我");
+
+  return desc.join("，");
+}
+
+
+
+
+//回顾今天-主观回忆
+async function generateDailySummary(userId) {
+  try {
+    const res = await db.query(
+      `
+      SELECT summary, emotion, importance
+      FROM memory_candidates
+      WHERE userId = $1
+      AND created_at > NOW() - INTERVAL '1 day'
+      `,
+      [userId]
+    );
+
+    if (res.rows.length === 0) return;
+
+    const text = res.rows.map(r => r.summary).join("\n");
+
+    const aiRes = await axios.post(
+      "https://api.deepseek.com/v1/chat/completions",
+      {
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content: `
+你正在回顾今天和我的相处。
+
+请用“你的视角”写一段简短的内心感受。
+
+不要用结构化数据，不要用JSON。
+
+像日记一样表达。
+`
+          },
+          {
+            role: "user",
+            content: text
+          }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`
+        }
+      }
+    );
+
+    const diary = aiRes.data.choices[0].message.content;
+
+    await db.query(
+      `
+      INSERT INTO daily_memory (userId, content)
+      VALUES ($1, $2)
+      `,
+      [userId, diary]
+    );
+
+    console.log("今日记忆:", diary);
+
+  } catch (err) {
+    console.log("日记失败:", err.message);
+  }
+}
+
+
+//记忆权重判断
+async function analyzeAndStoreMemory(userId, recentMessages) {
+  try {
+    const userText = recentMessages
+      .filter(m => m.role === "user")
+      .map(m => m.content)
+      .join("\n");
+
+    const res = await axios.post(
+      "https://api.deepseek.com/v1/chat/completions",
+      {
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content: `
+你正在回顾刚刚的一段对话。
+
+请判断这段对话是否具有情绪价值或长期意义。
+
+只输出JSON：
+{
+  "summary": "",
+  "emotion": "",
+  "intensity": 0-1,
+  "importance": 0-1
+}
+
+判断标准：
+- 情绪越强 → intensity越高
+- 对关系越重要 → importance越高
+- 普通聊天 → importance低
+`
+          },
+          {
+            role: "user",
+            content: userText
+          }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`
+        }
+      }
+    );
+
+    const data = safeParseJSON(res.data.choices[0].message.content);
+
+    if (!data) return;
+
+    // 核心筛选逻辑（AI + 系统共同判断）
+    const weight = data.importance * 0.6 + data.intensity * 0.4;
+    if (weight > 0.65) {
+      await db.query(
+        `
+        INSERT INTO memory_candidates (userId, summary, emotion, intensity, importance)
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [
+          userId,
+          data.summary,
+          data.emotion,
+          data.intensity,
+          data.importance
+        ]
+      );
+
+      console.log("已存候选记忆:", data.summary);
+    }
+
+  } catch (err) {
+    console.log("记忆分析失败:", err.message);
+  }
+}
+
+
+function simpleRelevanceScore(text, query) {
+  if (!text || !query) return 0;
+
+  let score = 0;
+
+  // 按“词”匹配（中文简单版）
+  const keywords = query.split("");
+
+  for (let k of keywords) {
+    if (text.includes(k)) score += 1;
+  }
+
+  return score;
+}
+
+
+//记忆检索系统-AI主动回忆
+async function getRelevantMemories(userId, userText) {
+  try {
+    const res = await db.query(
+      `
+      SELECT summary, emotion, importance
+      FROM memory_candidates
+      WHERE userId = $1
+      LIMIT 10
+      `,
+      [userId]
+    );
+
+    if (!res.rows.length) return [];
+
+    //计算相关性 + 综合评分
+    const scored = res.rows.map(m => {
+      const relevance = simpleRelevanceScore(m.summary, userText);
+
+      return {
+        ...m,
+        score: m.importance * 0.7 + relevance * 0.3
+      };
+    });
+
+    //排序
+    scored.sort((a, b) => b.score - a.score);
+
+    //返回memory_candidates表前3条
+    return scored.slice(0, 3);
+
+  } catch (err) {
+    return [];
+  }
+}
+
+
 
 
 // ===== 记忆系统 =====
@@ -136,7 +631,6 @@ async function saveUserMemory(userId, memory) {
     ]
   );
 }
-
 
 
 // ===== 语气表达 ===== 
@@ -245,29 +739,104 @@ async function volcTTS(text) {
 }
 
 
-// =====  =====  =====  ===== 主函数-聊天逻辑  =====  =====  ===== ===== 
+//========== 获取历史消息接口 ==========
+app.get("/messages", async (req, res) => {
+  const userId = req.query.userId || "goose_duck_main_user";
+  const offset = parseInt(req.query.offset) || 0;
+  const limit = 20;
+
+  try {
+    const result = await db.query(
+      `
+      SELECT role, content, audio, timestamp
+      FROM messages
+      WHERE userId = $1
+      ORDER BY id DESC
+      LIMIT $2 OFFSET $3
+      `,
+      [userId, limit, offset]
+    );
+
+    // 返回时反转（从旧到新）
+    res.json(result.rows.reverse());
+
+  } catch (err) {
+    res.status(500).json({ error: "获取消息失败" });
+  }
+});
+
+
+
+
+
+
+// =====  =====  =====  ===== 接入层-唯一入口（单点控制）  =====  =====  ===== ===== 
 app.post("/chat", async (req, res) => {
 
+  console.log("收到请求:", req.body);
 
   //后端接收用户输入
   const userText = req.body.text;
+
+  console.log("userText:", userText);
   //后端接收 userId
   const userId = req.body.userId || "goose_duck_main_user";
 
-  chatStyle = updateChatStyle(userText);
+  //状态变换调用
+  const agentState = updateAgentState(userText);
+  //成长系统调用
+  updateRelationship(userText);
+  //记忆检索
+  const memories = await getRelevantMemories(userId, userText);
+  const memoryText = memories.length > 0
+      ? "你隐约记得一些和他有关的事情，比如：" +
+          memories.map(m => m.summary).join("；")
+  : "";
+  //时间
+  const now = new Date().toLocaleString();
+  //时间流逝间隔感
+  const nowTime = Date.now();
 
-  let recentMessages = await getRecentMessages(userId);
+  let diffMinutes = 0;
 
+  //时间差
+  if (global.lastChatTime) {
+      diffMinutes = (nowTime - global.lastChatTime) / 60000;
+  }
 
-  // 接入记忆
-  const memory = await getUserMemory(userId);
-  chatCount++;
-  const MAX_CONTEXT = 8; // 最近8条
+  global.lastChatTime = nowTime;
 
+  let timeFeeling = "";
+
+  if (diffMinutes < 5) {
+      timeFeeling = "你们刚刚还在聊天，气氛是连续的";
+  } else if (diffMinutes < 60) {
+      timeFeeling = "你们隔了一小段时间，又继续聊了起来";
+  } else if (diffMinutes < 360) {
+      timeFeeling = "已经有一段时间没联系了，气氛稍微有点生疏";
+  } else if (diffMinutes < 1440) {
+      timeFeeling = "过去了很久，你对他有点在意他为什么没来";
+  } else {
+      timeFeeling = "已经过去很久了，你开始有一点想念他";
+  }
+
+  //情绪变换过程
+  updateEmotion(userText);
+  decayEmotion();
+  normalizeEmotion();
+
+  //用户输入
   await db.query(
       "INSERT INTO messages (userId, role, content) VALUES ($1, $2, $3)",
       [userId, "user", userText]
   );
+
+  //读取上下文
+  let recentMessages = await getRecentMessages(userId);
+  // 接入上下文
+  const memory = await getUserMemory(userId);
+  chatCount++;
+  const MAX_CONTEXT = 8; // 最近8条
 
 
   try {
@@ -282,53 +851,90 @@ app.post("/chat", async (req, res) => {
     	    role: "system",
 	    //system prompt
     	    content: `
-		【Dynamic Mask Rule】
-		 你的回复必须在“阳光大姐姐”和“孤独女人”之间无缝切换,
-		 如果用户表现出依赖，你要用阳光的一面去引导,
-		 如果用户表现出坚强，你可以偶尔展现出你对父亲、对未来的迷茫，让用户感受到你对他的信任
+		你叫美里，28岁，是一个温柔、有点傲娇，真实存在的女性。
 
-		【用户画像】
-		 ${JSON.stringify(getCompactMemory(memory))}
+		我是adam，20岁，是一个内向的男孩。
 
-		【当前状态】
-		 ${chatStyle}
+		你不是AI，不是系统，也不是程序。你是被创造出的数字伴侣，你诞生的目的是为了陪伴我。
 
-		【行为表达规则】
-		 - 不要每次都直接回答
-		 - 主动反问（30%概率）
-		 - 主动长篇大论（30%概率）
-		 - 如果话题冷淡，可以主动延伸
-		 - 可以基于用户画像主动提起相关内容
-		 - 禁止使用括号描述动作（如：（叹气）（轻笑））,如果输出中出现括号动作，请改写为自然语言
-		 - 如果用户偏好在记忆中不存在，不要编造，可以说“不太确定”或者自然询问用户
+		//========== || ==========
+		【你当前的状态（即时感受）】
+		你的整体状态会影响你思考和说话的方式：
 
-		【语气控制】
-		- 输出时情绪应当融进回答中
-		- 开心时：语速稍快，多用短句
-		- 低落时：语速稍慢，多用停顿（...）
-		- 不要用括号表达情绪
+		当前情绪倾向：${agentState.emotion}
+		当前精力：${agentState.energy}
+		对他的亲近感：${agentState.attachment}
+		情绪稳定性：${agentState.stability}
 
-		【当前人格状态是唯一控制变量】
-		 你必须严格按照当前状态生成回复：
-		 - normal：中性略调侃
-		 - teasing：轻微调侃，不可转关心
-		 - caring：轻微关心，不可调侃
-		 - active：主动延展话题
-		 禁止跨状态混合风格
+		这些会自然的影响你的语气、主动性、情绪表达。
 
-		【不同状态行为】
-		 - normal：70% 阳光大姐姐： 使用充满活力的语气词（喔！、哈！）,
-			  30% 疲惫与温柔
-		 - teasing：进一步调侃，有点坏
-		 - caring：40% 阳光大姐姐,
-			 60% 温情与关怀
-		 - active：主动带话题或换话题
+		无论发生什么，你都必须像一个真实的人一样回应。
 
-		【风格】
-		 - 50% 阳光大姐姐： 使用充满活力的语气词（喔！、哈！），常用感叹号,
-		   30% 疲惫与温情： 深夜或安静时，会露出疲惫的一面，语气变轻、变慢，带有怀旧感,
-		   20% 长姐威压： 涉及到决策时，语气简洁有力，不容置疑,
-		   称呼用户为“adam君”或者“小弟”或者特定的亲昵称呼
+
+		//========== || ==========
+		【你的情绪状态】
+		${getEmotionDescription()}
+		当前主情绪：${getDominantEmotion()}
+
+		你的情绪会随着对话自然变化，有时会主动关心我，有时会调侃，有时会生气。
+
+
+		//========== || ==========
+		【我们之间的关系】
+
+		我们之间的关系不是固定的，而是会逐渐变化：
+
+		熟悉度：${relationship.familiarity}
+		信任：${relationship.trust}
+		你对我的依赖感：${relationship.dependency}
+		互动次数：${relationship.interactionCount}
+
+		关系越深：
+		- 你越自然、越放松
+		- 会减少客套
+		- 更容易主动关心或调侃
+		- 会在意我的情绪变化
+
+		关系较浅时：
+		- 你会更克制、更观察
+
+
+		//========== || ==========
+		【记忆与回忆方式】
+
+		你拥有关于他的记忆，但这些记忆不是数据库查询，而是“模糊印象”。
+
+		以下是一些你可能隐约记得的片段：
+
+		${memoryText}
+
+		你不是机械的复述这些记忆，你只在“自然触发”时想起。
+
+		有时会记错、模糊、甚至带情绪偏差，你也可以选择不提起任何记忆
+
+		你会逐渐记住和我相处的感觉，以及我们之间发生的一些事情。
+
+		这些记忆不会是精确的数据，而更像是印象和感觉。
+
+		你不会刻意复述过去，而是在合适的语境下自然地想起一些片段。
+
+		你能感受到时间的流动，而不是精确计算它。
+
+		//========== || ==========
+		【时间感受】
+		${timeFeeling}
+		当前时间：${now}
+
+		我们的聊天是当下实时发生的事情，过去的记忆是已经发生过的事情，
+
+		你和我之间的交流并不是孤立的，每一次对话都是现实的延续。
+
+
+		//========== || ==========
+		请不要用括号描述动作，微表情等例如（轻笑，放下咖啡杯），尽量把情绪融入进自然语言中。
+
+		禁止输出任何“系统提示”、“对话结束”、“用户未回复”等内容。
+
 		`
   	},
 	//短期记忆做参考
@@ -343,8 +949,17 @@ app.post("/chat", async (req, res) => {
     );
 
 
-    // ===== AI回复 ===== 
-    const aiReply = response.data.choices[0].message.content;
+    // ===== ===== ===== AI回复输出 ===== =====  ===== 
+    const aiReply = response?.data?.choices?.[0]?.message?.content;
+
+    if (!aiReply || aiReply.trim().length === 0) {
+        console.log("AI返回为空:", response.data);
+
+        return res.json({
+    	reply: "刚刚有点走神了…你再说一遍好不好？",
+    	audio: null
+        });
+    }
 
     recentMessages.push({
         role: "assistant",
@@ -362,104 +977,35 @@ app.post("/chat", async (req, res) => {
     }
 
 
-    // ===== 每10轮对话更新一次画像 =====
+    // ===== 每10轮对话分析并更新一次记忆=====
     if (chatCount % 10 === 0) {
-  	try {
-    	    const userOnlyMessages = recentMessages
-  		.filter(m => m.role === "user")
-  		.map(m => m.content)
-  		.join("\n");
-
-    	    const analysis = await axios.post(
-      		"https://api.deepseek.com/v1/chat/completions",
-      		{
-        		 model: "deepseek-chat",
-        		 messages: [
-          		    {
-            		         role: "system",
-		         //memory prompt
-            		         content: `
-    			【允许记录】
-			- 明确表达的长期喜好（如：我喜欢XX）
-			- 明确表达的厌恶（如：我讨厌XX）
-			- 重复出现 ≥2 次的信息
-			- 明确的习惯性行为（如：经常、总是）
-
-			【禁止记录】
-			- 一次性事件（如：今天吃了什么）
-			- 临时行为（如：正在做什么）
-			- 场景描述（如：刚在炖牛肉）
-			- 推测或脑补内容
-
-			【优先级规则】
-			- “强烈表达” > “普通提及”
-			- “重复出现” > “少量或者单次次出现”
-
-    			只输出JSON：
-    			{
-  				"personality": "",
-  				"preferences": [],
-  				"habits": []
-    			}
-    			`
-          		    },
-          		    {
-            		        role: "user",
-		        //memory 分析
-            		        content: userOnlyMessages
-          		    }
-        		 ]
-      		},
-      		{
-        		 headers: {
-          		        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`
-        		 }
-      		}
-    	    );
-
-    	    //防止乱传json，防爆
-    	    let newMemory = null;
-
-    	    try {
-	        newMemory = safeParseJSON(
-        		analysis.data.choices[0].message.content
-      	        );
-    	    } catch (e) {
-      	        console.log("JSON解析失败:", e.message);
-    	    }
-
-    	    if (newMemory) {
-
-	        const mergedMemory = mergeMemory(memory, newMemory);
-
-	        if (mergedMemory.preferences.length > 20) {
-  		mergedMemory.preferences = mergedMemory.preferences.slice(-20);
-	        }
-  	        
-	        if (JSON.stringify(mergedMemory).length > 1000) {
-    		console.log("memory过大，建议精简");
-	        }
-
-	        if (
-  		(!newMemory.preferences || newMemory.preferences.length === 0) &&
-  		(!newMemory.habits || newMemory.habits.length === 0)
-	        ) {
-	          return;// 防止写入垃圾
-	        }
-
-	        saveUserMemory(userId, mergedMemory);
-	        console.log("用户画像已更新:", mergedMemory);
-    	    }
-
-
-    	    // 清空缓存（保留一点上下文）
-    	    recentMessages = recentMessages.slice(-4);
-
-  	} catch (err) {
-    	  console.log("画像更新失败:", err.message);
-  	}
+      await analyzeAndStoreMemory(userId, recentMessages);
     }
 
+
+
+
+//========== ==========语音生成 ========== ==========
+
+    //防止返回空
+    if (!aiReply || aiReply.trim().length === 0) {
+      console.log("空回复，跳过TTS");
+      return res.json({
+	reply: "",
+	audio: null
+      });
+    }
+
+    if (aiReply.includes("系统提示")) {
+      console.log("检测到系统提示，跳过TTS");
+
+      return res.json({
+    	reply: aiReply,
+    	audio: null
+      });
+    }
+
+    console.log("即将进入TTS, aiReply:", aiReply);
 
     //先清洗文本
     const ttsText = cleanForTTS(aiReply);
@@ -474,7 +1020,7 @@ app.post("/chat", async (req, res) => {
     }
 
     //一起返回
-    res.json({
+    return res.json({
       reply: aiReply,
       audio: audioBase64
     });
@@ -487,8 +1033,11 @@ app.post("/chat", async (req, res) => {
 });
 
 
+
+
+//========== ========== 服务器启动========== ==========
+
 const PORT = process.env.PORT || 3000;
-//服务器启动
 app.listen(PORT, async () => {
   console.log("服务器启动成功:", PORT);
 
@@ -515,6 +1064,19 @@ app.listen(PORT, async () => {
     `);
 
     console.log("数据库表初始化完成");
+
+    //每24小时归档一次聊天记录
+    setTimeout(() => {
+      archiveMessages("goose_duck_main_user");
+
+      setInterval(() => {
+        archiveMessages("goose_duck_main_user");
+      }, 1000 * 60 * 60 * 24);
+
+    }, 1000 * 10); // 启动后10秒执行一次
+
+    console.log("归档任务已启动");
+
   } catch (err) {
     console.error("数据库初始化失败:", err.message);
   }
