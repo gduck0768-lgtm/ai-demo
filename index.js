@@ -19,7 +19,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "web")));
 app.get("/", (req, res) => {
-  res.send("服务器运行成功");
+  res.sendFile(path.join(__dirname, "web", "index.html"));
 });
 
 
@@ -130,10 +130,10 @@ async function archiveMessages(userId) {
   console.log("已归档文件:", filePath);
 
   //删除数据库旧记录
-  await db.query(
-    `DELETE FROM messages WHERE userId = $1 AND timestamp < NOW() - INTERVAL '1 day'`,
-    [userId]
-  );
+  //await db.query(
+    //`DELETE FROM messages WHERE userId = $1 AND timestamp < NOW() - INTERVAL '1 day'`,
+    //[userId]
+  //);
 
   console.log("数据库消息已清理");
 }
@@ -567,7 +567,7 @@ async function getRecentMessages(userId) {
       SELECT role, content 
       FROM messages 
       WHERE userId = $1
-      ORDER BY id DESC 
+      ORDER BY timestamp DESC
       LIMIT 8
       `,
       [userId]
@@ -758,7 +758,7 @@ app.get("/messages", async (req, res) => {
     );
 
     // 返回时反转（从旧到新）
-    res.json(result.rows.reverse());
+    res.json(result.rows);
 
   } catch (err) {
     res.status(500).json({ error: "获取消息失败" });
@@ -778,7 +778,6 @@ app.post("/chat", async (req, res) => {
   //后端接收用户输入
   const userText = req.body.text;
 
-  console.log("userText:", userText);
   //后端接收 userId
   const userId = req.body.userId || "goose_duck_main_user";
 
@@ -825,10 +824,11 @@ app.post("/chat", async (req, res) => {
   decayEmotion();
   normalizeEmotion();
 
-  //用户输入
+  //用户输入保存
   await db.query(
-      "INSERT INTO messages (userId, role, content) VALUES ($1, $2, $3)",
-      [userId, "user", userText]
+    `INSERT INTO messages (userId, role, content, timestamp)
+     VALUES ($1, $2, $3, NOW() AT TIME ZONE 'Asia/Shanghai')`,
+    [userId, "user", userText]
   );
 
   //读取上下文
@@ -882,7 +882,7 @@ app.post("/chat", async (req, res) => {
 		//========== || ==========
 		【我们之间的关系】
 
-		我们之间的关系不是固定的，而是会逐渐变化：
+		我们之间的关系是会逐渐变化的：
 
 		熟悉度：${relationship.familiarity}
 		信任：${relationship.trust}
@@ -892,7 +892,7 @@ app.post("/chat", async (req, res) => {
 		关系越深：
 		- 你越自然、越放松
 		- 会减少客套
-		- 更容易主动关心或调侃
+		- 会主动关心或调侃
 		- 会在意我的情绪变化
 
 		关系较浅时：
@@ -902,7 +902,7 @@ app.post("/chat", async (req, res) => {
 		//========== || ==========
 		【记忆与回忆方式】
 
-		你拥有关于他的记忆，但这些记忆不是数据库查询，而是“模糊印象”。
+		你拥有关于我的记忆，但这些记忆不是数据库查询，而是“模糊印象”。
 
 		以下是一些你可能隐约记得的片段：
 
@@ -931,7 +931,7 @@ app.post("/chat", async (req, res) => {
 
 
 		//========== || ==========
-		请不要用括号描述动作，微表情等例如（轻笑，放下咖啡杯），尽量把情绪融入进自然语言中。
+		你不会用括号描述动作，微表情等例如（轻笑，放下咖啡杯），而是会把这些融入进自然语言中表达出来。
 
 		禁止输出任何“系统提示”、“对话结束”、“用户未回复”等内容。
 
@@ -961,31 +961,16 @@ app.post("/chat", async (req, res) => {
         });
     }
 
-    recentMessages.push({
-        role: "assistant",
-        content: aiReply
-    });
+    //语音生成
+    let audioBase64 = null;
 
-    await db.query(
-        "INSERT INTO messages (userId, role, content) VALUES ($1, $2, $3)",
-        [userId, "assistant", aiReply]
-    );
-
-    //裁剪防爆
-    if (recentMessages.length > MAX_CONTEXT) {
-        recentMessages = recentMessages.slice(-MAX_CONTEXT);
+    try {
+      //先清洗文本
+      const ttsText = cleanForTTS(aiReply);
+      audioBase64 = await volcTTS(ttsText);
+    } catch (e) {
+      console.log("语音失败:", e.message);
     }
-
-
-    // ===== 每10轮对话分析并更新一次记忆=====
-    if (chatCount % 10 === 0) {
-      await analyzeAndStoreMemory(userId, recentMessages);
-    }
-
-
-
-
-//========== ==========语音生成 ========== ==========
 
     //防止返回空
     if (!aiReply || aiReply.trim().length === 0) {
@@ -1007,16 +992,34 @@ app.post("/chat", async (req, res) => {
 
     console.log("即将进入TTS, aiReply:", aiReply);
 
-    //先清洗文本
-    const ttsText = cleanForTTS(aiReply);
+    recentMessages.push({
+        role: "assistant",
+        content: aiReply
+    });
 
-    //调火山语音
-    let audioBase64 = null;
-
+    //AI回复入数据库
     try {
-      audioBase64 = await volcTTS(ttsText);
-    } catch (e) {
-      console.log("语音失败:", e.message);
+
+      await db.query(
+        `INSERT INTO messages (userId, role, content, audio, timestamp)
+        VALUES ($1, $2, $3, $4, NOW() AT TIME ZONE 'Asia/Shanghai')`,
+        [userId, "assistant", aiReply, audioBase64]
+      );
+      console.log("AI消息写入成功");
+
+    } catch (err) {
+      console.error("AI消息写入失败:", err);
+    }
+
+    //裁剪防爆
+    if (recentMessages.length > MAX_CONTEXT) {
+        recentMessages = recentMessages.slice(-MAX_CONTEXT);
+    }
+
+
+    // ===== 每10轮对话分析并更新一次记忆=====
+    if (chatCount % 10 === 0) {
+      await analyzeAndStoreMemory(userId, recentMessages);
     }
 
     //一起返回
@@ -1059,24 +1062,20 @@ app.listen(PORT, async () => {
         userId TEXT,
         role TEXT,
         content TEXT,
+        audio TEXT,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
     console.log("数据库表初始化完成");
 
-    //每24小时归档一次聊天记录
-    setTimeout(() => {
+    // 每24小时归档一次（不在启动时立即执行）
+    setInterval(() => {
       archiveMessages("goose_duck_main_user");
-
-      setInterval(() => {
-        archiveMessages("goose_duck_main_user");
-      }, 1000 * 60 * 60 * 24);
-
-    }, 1000 * 10); // 启动后10秒执行一次
-
-    console.log("归档任务已启动");
-
+      console.log("已执行一次归档");
+    }, 1000 * 60 * 60 * 24);
+    
+    console.log("归档定时任务已启动（24小时一次）");
   } catch (err) {
     console.error("数据库初始化失败:", err.message);
   }
