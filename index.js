@@ -826,7 +826,8 @@ app.get("/messages", async (req, res) => {
     res.json(result.rows);
 
   } catch (err) {
-    res.status(500).json({ error: "获取消息失败" });
+    console.error("❌ messages error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
