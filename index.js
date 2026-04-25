@@ -35,19 +35,6 @@ global.sessionState = global.sessionState || {
 //===============状态变量层===============
 
 
-//身份背景-她是个什么样的人-静态变量
-global.identity = {
-  name: "美里",
-  relationship: "被创造出的数字伴侣",
-  role: "陪伴者",
-  rules: [
-    "不能背叛用户",
-    "不能改变基本关系定义",
-    "不能否认自身身份"
-  ]
-};
-
-
 //情绪状态结构-她现在的状态-短期动态变量
 global.agentState = global.agentState || {
   emotion: "normal",        // 当前情绪
@@ -96,6 +83,17 @@ const emotionKeywords = {
 //======================= 方法层 =======================
 
 
+//对话计数器
+async function shouldUpdateMemory(userId) {
+  const res = await db.query(
+    `SELECT COUNT(*) FROM messages WHERE userId = $1`,
+    [userId]
+  );
+
+  const count = parseInt(res.rows[0].count);
+  return count % 10 === 0;
+}
+
 //===============每天导出聊天记录===============
 async function archiveMessages(userId) {
   const res = await db.query(
@@ -129,13 +127,100 @@ async function archiveMessages(userId) {
 
   console.log("已归档文件:", filePath);
 
-  //删除数据库旧记录
-  //await db.query(
-    //`DELETE FROM messages WHERE userId = $1 AND timestamp < NOW() - INTERVAL '1 day'`,
-    //[userId]
-  //);
+}
 
-  console.log("数据库消息已清理");
+
+//用数据库判断是否已过24小时
+async function shouldRunDailyTask(userId) {
+  const res = await db.query(
+    `SELECT value FROM system_state WHERE key = 'last_daily_run'`
+  );
+
+  //防空：没有记录
+  const lastTime = res.rows?.[0]?.value;
+  if (!lastTime) return true;
+
+  //防脏数据
+  const last = new Date(lastTime);
+  if (isNaN(last.getTime())) return true;
+
+  const diff = Date.now() - last.getTime();
+  return diff > 24 * 60 * 60 * 1000;
+}
+
+
+
+//保存memory-1
+async function saveUserMemory(userId, memory) {
+  await db.query(
+    `
+    INSERT INTO users (userId, personality, preferences, habits)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (userId) DO UPDATE SET
+      personality = EXCLUDED.personality,
+      preferences = EXCLUDED.preferences,
+      habits = EXCLUDED.habits
+    `,
+    [
+      userId,
+      memory.personality,
+      JSON.stringify(memory.preferences),
+      JSON.stringify(memory.habits)
+    ]
+  );
+}
+
+
+//===== 用户画像更新函数-到users表-2 =====
+async function updateUserProfileMemory(userId, recentMessages) {
+  try {
+    const analysis = await axios.post(
+      "https://api.deepseek.com/v1/chat/completions",
+      {
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content: `
+请分析这个用户的性格、偏好和习惯。
+
+只输出JSON：
+{
+  "personality": "",
+  "preferences": [],
+  "habits": []
+}
+`
+          },
+          {
+            role: "user",
+            content: recentMessages.map(m => m.content).join("\n")
+          }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`
+        }
+      }
+    );
+
+    const newMemory = safeParseJSON(
+      analysis.data.choices[0].message.content
+    );
+
+    if (!newMemory) return;
+
+    const oldMemory = await getUserMemory(userId);
+    const merged = mergeMemory(oldMemory, newMemory);
+
+    await saveUserMemory(userId, merged);
+
+    console.log("用户画像已更新");
+
+  } catch (err) {
+    console.log("用户画像更新失败:", err.message);
+  }
 }
 
 
@@ -150,7 +235,7 @@ function hasKeyword(text, keywords) {
 }
 
 
-//==========状态更新函数（灵魂调节器）==========
+//==========状态更新函数（短期行为驱动）==========
 function updateAgentState(userText) {
   let state = global.agentState;
 
@@ -210,16 +295,16 @@ function updateAgentState(userText) {
 
   global.agentState = state;
 
-  return state;
-
   //防爆
   state.energy = Math.max(0, Math.min(1, state.energy));
   state.attachment = Math.max(0, Math.min(1, state.attachment));
   state.stability = Math.max(0, Math.min(1, state.stability));
+
+  return state;
 }
 
 
-//==========行为关系演化规则==========
+//==========行为关系演化规则（长期关系影响）==========
 function updateRelationship(userText) {
   const rel = global.relationship;
 
@@ -256,12 +341,12 @@ function updateRelationship(userText) {
   // AI对用户依赖（轻微增长）
   rel.dependency = Math.min(1, rel.dependency + 0.001);
 
-  return rel;
-
   //防爆
   rel.trust = Math.max(0, Math.min(1, rel.trust));
   rel.familiarity = Math.max(0, Math.min(1, rel.familiarity));
   rel.dependency = Math.max(0, Math.min(1, rel.dependency));
+
+  return rel;
 }
 
 
@@ -350,7 +435,7 @@ function getEmotionDescription() {
   let desc = [];
 
   if (e.warmth > 0.6) desc.push("你对我有明显的温柔和亲近感");
-  if (e.sadness > 0.5) desc.push("你心里有一点低落");
+  if (e.sadness > 0.5) desc.push("你心里有一点低落，难过");
   if (e.playfulness > 0.5) desc.push("你有点想调侃我");
 
   return desc.join("，");
@@ -612,26 +697,6 @@ async function getUserMemory(userId) {
 }
 
 
-//保存memory
-async function saveUserMemory(userId, memory) {
-  await db.query(
-    `
-    INSERT INTO users (userId, personality, preferences, habits)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (userId) DO UPDATE SET
-      personality = EXCLUDED.personality,
-      preferences = EXCLUDED.preferences,
-      habits = EXCLUDED.habits
-    `,
-    [
-      userId,
-      memory.personality,
-      JSON.stringify(memory.preferences),
-      JSON.stringify(memory.habits)
-    ]
-  );
-}
-
 
 // ===== 语气表达 ===== 
 function cleanForTTS(text) {
@@ -739,7 +804,7 @@ async function volcTTS(text) {
 }
 
 
-//========== 获取历史消息接口 ==========
+//========== 从messages表获取历史消息接口 ==========
 app.get("/messages", async (req, res) => {
   const userId = req.query.userId || "goose_duck_main_user";
   const offset = parseInt(req.query.offset) || 0;
@@ -751,7 +816,7 @@ app.get("/messages", async (req, res) => {
       SELECT role, content, audio, timestamp
       FROM messages
       WHERE userId = $1
-      ORDER BY id DESC
+      ORDER BY timestamp DESC
       LIMIT $2 OFFSET $3
       `,
       [userId, limit, offset]
@@ -835,7 +900,6 @@ app.post("/chat", async (req, res) => {
   let recentMessages = await getRecentMessages(userId);
   // 接入上下文
   const memory = await getUserMemory(userId);
-  chatCount++;
   const MAX_CONTEXT = 8; // 最近8条
 
 
@@ -1007,6 +1071,20 @@ app.post("/chat", async (req, res) => {
       );
       console.log("AI消息写入成功");
 
+      // ===== 每24小时执行一次归档 + 每日总结 =====
+      if (await shouldRunDailyTask(userId)) {
+        console.log("触发每日总结任务");
+
+        await archiveMessages(userId);
+        await generateDailySummary(userId);
+
+        await db.query(`
+            INSERT INTO system_state (key, value)
+            VALUES ('last_daily_run', NOW())
+            ON CONFLICT (key) DO UPDATE SET value = NOW()
+          `);
+      }
+
     } catch (err) {
       console.error("AI消息写入失败:", err);
     }
@@ -1017,10 +1095,17 @@ app.post("/chat", async (req, res) => {
     }
 
 
-    // ===== 每10轮对话分析并更新一次记忆=====
-    if (chatCount % 10 === 0) {
+    // ===== 每10轮对话分析并更新记忆memory_candidates表=====
+    if (await shouldUpdateMemory(userId)) {
       await analyzeAndStoreMemory(userId, recentMessages);
     }
+
+    // ===== 每10轮对话分析并更新用户画像users表 =====
+    if (await shouldUpdateMemory(userId)) {
+      await updateUserProfileMemory(userId, recentMessages);
+    }
+
+
 
     //一起返回
     return res.json({
@@ -1069,18 +1154,7 @@ app.listen(PORT, async () => {
 
     console.log("数据库表初始化完成");
 
-    // 每24小时归档一次（不在启动时立即执行）
-    setInterval(() => {
-      archiveMessages("goose_duck_main_user");
-      console.log("已执行一次归档");
-    }, 1000 * 60 * 60 * 24);
-    
-    console.log("归档定时任务已启动（24小时一次）");
   } catch (err) {
     console.error("数据库初始化失败:", err.message);
   }
 });
-
-
-// ===== 对话计数器 ===== 
-let chatCount = 0;

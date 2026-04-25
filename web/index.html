@@ -13,10 +13,11 @@
       background: #e6f2ef;
     }
 
-    //背景颜色
+    /* 背景颜色 */
     body {
       margin: 0;
       padding: 0;
+      height: 100%;
       background: #e6f2ef;
       display: flex;
       flex-direction: column;
@@ -25,10 +26,13 @@
     #chat {
       flex: 1;
       width: 100%;
-      height: 80vh;
+      height: calc(100vh - 80px);
       overflow-y: auto;
       padding: 10px;
       box-sizing: border-box;
+      padding-bottom: 80px;
+      display: flex;
+      flex-direction: column;
     }
 
     .msg {
@@ -78,8 +82,9 @@
       display: flex;
       gap: 8px;
       padding: 10px;
-      background: #f2f2f2;   /* 👈 浅灰色 */
+      background: #f2f2f2;  
       box-sizing: border-box;
+      z-index: 1000;
     }
 
 
@@ -118,6 +123,7 @@ const API_BASE = window.location.origin;
 const userId = "goose_duck_main_user";
 localStorage.setItem("uid", userId);
 
+
 function escapeHtml(text) {
   return text
     .replace(/&/g, "&amp;")
@@ -127,10 +133,32 @@ function escapeHtml(text) {
     .replace(/'/g, "&#039;");
 }
 
-function scrollToBottom() {
-  const chat = document.getElementById("chat");
-  chat.scrollTop = chat.scrollHeight;
+function getLastMessageTime() {
+  const msgs = [...chat.querySelectorAll(".msg")];
+  const last = msgs[msgs.length - 1];
+  return last?.dataset?.time;
 }
+
+//滚动条
+//判断是否在底部
+function isAtBottom() {
+  const chat = document.getElementById("chat");
+  return chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 80;
+}
+
+//调度器-渲染后统一滚动
+function scheduleScroll() {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const chat = document.getElementById("chat");
+
+      if (isAtBottom()) {
+        chat.scrollTop = chat.scrollHeight;
+      }
+    });
+  });
+}
+
 
 let globalAudio = null;
 
@@ -177,7 +205,11 @@ function formatChatTime(current, previous) {
   const cur = new Date(current);
   const prev = previous ? new Date(previous) : null;
 
-  if (!prev) return null;
+  if (!prev) {
+    const hh = String(cur.getHours()).padStart(2, '0');
+    const mm = String(cur.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
 
   const diffMin = (cur - prev) / 1000 / 60;
 
@@ -207,7 +239,6 @@ function formatChatTime(current, previous) {
 const chat = document.getElementById("chat");
 
 let offset = 0;
-const limit = 20;
 let loading = false;
 let hasMore = true;
 
@@ -218,10 +249,10 @@ async function loadMessages() {
   if (loading || !hasMore) return;
   loading = true;
 
-  const res = await fetch(`${API_BASE}/messages?userId=${userId}&offset=${offset}&limit=20`)
+  const res = await fetch(`${API_BASE}/messages?userId=${userId}&offset=${offset}&limit=20`);
   const data = await res.json();
 
-  if (data.length === 0) {
+  if (!data.length) {
     hasMore = false;
     loading = false;
     return;
@@ -229,46 +260,54 @@ async function loadMessages() {
 
   const fragment = document.createDocumentFragment();
 
-  data.reverse().forEach((msg, index) => {
+  let lastTimestamp = null;
 
-  const prev = data[index + 1]; // 注意 reverse 后顺序
+  data.reverse().forEach((msg) => {
 
-  const timeLabel = formatChatTime(msg.timestamp, prev?.timestamp);
+    const timeLabel = formatChatTime(msg.timestamp, lastTimestamp);
+    lastTimestamp = msg.timestamp;
 
-  if (timeLabel) {
-    const timeDiv = document.createElement("div");
-    timeDiv.className = "time-divider";
-    timeDiv.innerHTML = `<span>${timeLabel}</span>`;
-    fragment.appendChild(timeDiv);
-  }
+    if (timeLabel) {
+      const timeDiv = document.createElement("div");
+      timeDiv.className = "time-divider";
+      timeDiv.innerHTML = `<span>${timeLabel}</span>`;
+      fragment.appendChild(timeDiv);
+    }
 
-  const div = document.createElement("div");
-  div.className = "msg " + (msg.role === "user" ? "user" : "ai");
+    const div = document.createElement("div");
+    div.className = "msg " + (msg.role === "user" ? "user" : "ai");
+    div.dataset.time = msg.timestamp;
 
-  div.innerHTML = `
-    <div class="bubble">
-      ${escapeHtml(msg.content)}
-      ${msg.audio ? `<button onclick="playAudio('${msg.audio}')">🔊</button>` : ""}
-    </div>
-  `;
+    div.innerHTML = `
+      <div class="bubble">
+        ${escapeHtml(msg.content)}
+        ${msg.audio ? `<button onclick="playAudio('${msg.audio}')">🔊</button>` : ""}
+      </div>
+    `;
 
-  fragment.appendChild(div);
-});
+    fragment.appendChild(div);
+  });
 
   chat.prepend(fragment);
 
-  //关键：offset 增长
   offset += data.length;
-
   loading = false;
 }
 
 // =======================
 // 上滑触发加载
 // =======================
-chat.addEventListener("scroll", () => {
-  if (chat.scrollTop < 50) {
-    loadMessages();
+chat.addEventListener("scroll", async () => {
+  if (chat.scrollTop < 80 && !loading && hasMore) {
+
+    const oldHeight = chat.scrollHeight;
+
+    await loadMessages();
+
+    const newHeight = chat.scrollHeight;
+
+    //关键：保持视图不跳
+    chat.scrollTop = newHeight - oldHeight + chat.scrollTop;
   }
 });
 
@@ -284,8 +323,7 @@ async function send() {
   // 用户消息
   const now = new Date().toISOString();
 
-  const lastMsgEl = [...chat.querySelectorAll(".msg")].pop();
-  const lastTime = lastMsgEl?.dataset?.time;
+  const lastTime = getLastMessageTime();
 
   const timeLabel = formatChatTime(now, lastTime);
 
@@ -303,7 +341,7 @@ async function send() {
   `;
 
   input.value = "";
-  scrollToBottom();
+  scheduleScroll();
 
   try {
     const res = await fetch(`${API_BASE}/chat`, {
@@ -317,8 +355,7 @@ async function send() {
     // AI消息
     const nowAI = new Date().toISOString();
 
-    const lastMsgEl = [...chat.querySelectorAll(".msg")].pop();
-    const lastTime = lastMsgEl?.dataset?.time;
+    const lastTime = getLastMessageTime();
 
     const timeLabel = formatChatTime(nowAI, lastTime);
 
@@ -337,8 +374,7 @@ async function send() {
         </div>
       </div>
     `;
-
-    scrollToBottom();
+    scheduleScroll();
 
     if (data.audio) {
       playAudio(data.audio);
